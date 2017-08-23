@@ -1,2 +1,3 @@
 torch
 torchvision
+mpi4py
