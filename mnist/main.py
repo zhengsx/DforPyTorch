@@ -1,3 +1,9 @@
+from mpi4py import MPI
+
+comm = MPI.COMM_WORLD
+comm_rank = comm.Get_rank()
+comm_size = comm.Get_size()
+
 from __future__ import print_function
 import argparse
 import torch
@@ -6,6 +12,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.autograd import Variable
+
+
 
 # Training settings
 parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
@@ -83,6 +91,8 @@ def train(epoch):
         output = model(data)
         loss = F.nll_loss(output, target)
         loss.backward()
+        grads = [param.grad for param in model.parameters()]
+        sum_grads = comm.allreduce(data, op=MPI.SUM)
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
