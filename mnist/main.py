@@ -1,10 +1,14 @@
+# from __future__ import print_function
+
 from mpi4py import MPI
 
 comm = MPI.COMM_WORLD
 comm_rank = comm.Get_rank()
 comm_size = comm.Get_size()
 
-from __future__ import print_function
+def mpi_list_sum(x,y):
+    return [a+b for a,b in zip(x,y)]
+
 import argparse
 import torch
 import torch.nn as nn
@@ -22,7 +26,7 @@ parser.add_argument('--batch-size', type=int, default=64, metavar='N',
 parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                     help='input batch size for testing (default: 1000)')
 parser.add_argument('--epochs', type=int, default=10, metavar='N',
-                    help='number of epochs to train (default: 10)')
+                    help='number of epochs to train (default:ls 10)')
 parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                     help='learning rate (default: 0.01)')
 parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
@@ -36,12 +40,16 @@ parser.add_argument('--log-interval', type=int, default=10, metavar='N',
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 
-torch.manual_seed(args.seed)
+torch.manual_seed(comm_rank)
 if args.cuda:
     torch.cuda.manual_seed(args.seed)
 
+if args.batch_size % comm_size != 0:
+    msg = "Error: Batch Size must can be divide exactly by worker number."
+    raise Exception(msg)
 
-kwargs = {'num_workers': 1, 'pin_memory': True} if args.cuda else {}
+
+kwargs = {'num_workers': 0, 'pin_memory': False} if args.cuda else {}
 train_loader = torch.utils.data.DataLoader(
     datasets.MNIST('../data', train=True, download=True,
                    transform=transforms.Compose([
@@ -77,22 +85,39 @@ class Net(nn.Module):
 
 model = Net()
 if args.cuda:
-    model.cuda()
+    # model.cuda()
+    model.cuda(comm_rank)
 
-optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+optimizer = optim.SGD(model.parameters(), lr=args.lr * comm_size, momentum=args.momentum)
 
 def train(epoch):
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
+        #Split data into multiple workers
+        if comm_size > 1:
+            real_entire_batch_size = data.size()[0]
+            real_minibatch_size = int(real_entire_batch_size / comm_size)
+            if comm_rank < comm_size - 1:
+                data = data[comm_rank * real_minibatch_size : comm_rank * real_minibatch_size + real_minibatch_size]
+                target = target[comm_rank * real_minibatch_size : comm_rank * real_minibatch_size + real_minibatch_size]
+            else:
+                data = data[comm_rank * real_minibatch_size :]
+                target = target[comm_rank * real_minibatch_size :]
+
         if args.cuda:
-            data, target = data.cuda(), target.cuda()
+            # data, target = data.cuda(), target.cuda()
+            data, target = data.cuda(comm_rank), target.cuda(comm_rank)
         data, target = Variable(data), Variable(target)
         optimizer.zero_grad()
         output = model(data)
         loss = F.nll_loss(output, target)
         loss.backward()
-        grads = [param.grad for param in model.parameters()]
-        sum_grads = comm.allreduce(data, op=MPI.SUM)
+        if comm_size > 1:
+            grads = [param.grad.data.cpu().numpy() for param in model.parameters()]
+            avg_grads = [sum_grad / comm_size for sum_grad in comm.allreduce(grads, op=mpi_list_sum)]
+            for param, avg_grad in zip(model.parameters(), avg_grads):
+                # param.grad.data = torch.from_numpy(avg_grad).cuda()
+                param.grad.data = torch.from_numpy(avg_grad).cuda(comm_rank)
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
@@ -105,7 +130,8 @@ def test():
     correct = 0
     for data, target in test_loader:
         if args.cuda:
-            data, target = data.cuda(), target.cuda()
+            # data, target = data.cuda(), target.cuda()
+            data, target = data.cuda(comm_rank), target.cuda(comm_rank)
         data, target = Variable(data, volatile=True), Variable(target)
         output = model(data)
         test_loss += F.nll_loss(output, target, size_average=False).data[0] # sum up batch loss
@@ -116,7 +142,6 @@ def test():
     print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
         test_loss, correct, len(test_loader.dataset),
         100. * correct / len(test_loader.dataset)))
-
 
 for epoch in range(1, args.epochs + 1):
     train(epoch)
