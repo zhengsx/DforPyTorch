@@ -84,6 +84,14 @@ class Net(nn.Module):
         return F.log_softmax(x)
 
 model = Net()
+#All reduce the initial model
+if comm_size > 1:
+    datas = [param.data.numpy() for param in model.parameters()]
+    avg_datas = [sum_data / comm_size for sum_data in comm.allreduce(datas, op=mpi_list_sum)]
+    for param, avg_data in zip(model.parameters(), avg_datas):
+        # param.grad.data = torch.from_numpy(avg_grad).cuda()
+        param.data = torch.from_numpy(avg_data)
+
 if args.cuda:
     # model.cuda()
     model.cuda(comm_rank)
@@ -118,6 +126,7 @@ def train(epoch):
             for param, avg_grad in zip(model.parameters(), avg_grads):
                 # param.grad.data = torch.from_numpy(avg_grad).cuda()
                 param.grad.data = torch.from_numpy(avg_grad).cuda(comm_rank)
+        # return 0
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
