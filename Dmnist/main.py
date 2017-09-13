@@ -1,5 +1,7 @@
 # from __future__ import print_function
 
+import torch
+
 from mpi4py import MPI
 
 comm = MPI.COMM_WORLD
@@ -10,7 +12,7 @@ def mpi_list_sum(x,y):
     return [a+b for a,b in zip(x,y)]
 
 import argparse
-import torch
+# import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -31,8 +33,8 @@ parser.add_argument('--epochs', type=int, default=10, metavar='N',
                     help='number of epochs to train (default:ls 10)')
 parser.add_argument('--lr', type=float, default=0.01, metavar='LR',
                     help='learning rate (default: 0.01)')
-parser.add_argument('--momentum', type=float, default=0.5, metavar='M',
-                    help='SGD momentum (default: 0.5)')
+parser.add_argument('--momentum', type=float, default=0, metavar='M',
+                    help='SGD momentum (default: 0)')
 parser.add_argument('--no-cuda', action='store_true', default=False,
                     help='disables CUDA training')
 parser.add_argument('--seed', type=int, default=1, metavar='S',
@@ -43,6 +45,8 @@ parser.add_argument('--optim', type=str, default='ma', choices=['ma', 'dpsgd','d
                     help='Parallel Optimization methods: ')
 parser.add_argument('--rho', type=float, default=0.1,
                     help='lambda (default: 0.1)')
+parser.add_argument('--dataset', type=str, default='mnist', choices=['mnist', 'fashion'],
+                    help='Mnist or Fashion Mnist')
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -54,21 +58,171 @@ if args.batch_size % comm_size != 0:
     msg = "Error: Batch Size must can be divide exactly by worker number."
     raise Exception(msg)
 
+if args.dataset == 'fashion':
+    from fashion import fashion
 
 kwargs = {'num_workers': 0, 'pin_memory': False} if args.cuda else {}
-train_loader = torch.utils.data.DataLoader(
-    datasets.MNIST('../data', train=True, download=True,
+
+if args.dataset == 'fashion':
+    train_dataset = fashion(root = '../data/fashion',train=True,download=True,
+                            transform=transforms.Compose([
+                            transforms.ToTensor(),
+                            transforms.Normalize((0.1307,), (0.3081,))]))
+    test_dataset = fashion(root = '../data/fashion',train=False,
+                            transform=transforms.Compose([
+                            transforms.ToTensor(),
+                            transforms.Normalize((0.1307,), (0.3081,))]))
+elif args.dataset == 'mnist':
+    train_dataset = datasets.MNIST('../data/mnist', train=True, download=True,
                    transform=transforms.Compose([
                        transforms.ToTensor(),
-                       transforms.Normalize((0.1307,), (0.3081,))
-                   ])),
+                       transforms.Normalize((0.1307,), (0.3081,))]))
+    test_dataset = datasets.MNIST('../data/mnist', train=False, transform=transforms.Compose([
+                       transforms.ToTensor(),
+                       transforms.Normalize((0.1307,), (0.3081,))]))
+
+train_loader = torch.utils.data.DataLoader(
+    dataset=train_dataset,
     batch_size=args.batch_size, shuffle=True, **kwargs)
 test_loader = torch.utils.data.DataLoader(
-    datasets.MNIST('../data', train=False, transform=transforms.Compose([
-                       transforms.ToTensor(),
-                       transforms.Normalize((0.1307,), (0.3081,))
-                   ])),
-    batch_size=args.batch_size, shuffle=True, **kwargs)
+    dataset=test_dataset,
+    batch_size=args.batch_size, shuffle=False, **kwargs)
+
+from torch.optim import Optimizer
+class mockSGD(Optimizer):
+    def __init__(self, params, lr=0.1, momentum=0, dampening=0,
+                 weight_decay=0, nesterov=False):
+        defaults = dict(lr=lr, momentum=momentum, dampening=dampening,
+                        weight_decay=weight_decay, nesterov=nesterov)
+        if nesterov and (momentum <= 0 or dampening != 0):
+            raise ValueError("Nesterov momentum requires a momentum and zero dampening")
+        super(mockSGD, self).__init__(params, defaults)
+
+    def __setstate__(self, state):
+        super(mockSGD, self).__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault('nesterov', False)
+
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            weight_decay = group['weight_decay']
+            momentum = group['momentum']
+            dampening = group['dampening']
+            nesterov = group['nesterov']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                d_p = p.grad.data
+                if weight_decay != 0:
+                    d_p.add_(weight_decay, p.data)
+                if momentum != 0:
+                    param_state = self.state[p]
+                    if 'momentum_buffer' not in param_state:
+                        buf = param_state['momentum_buffer'] = d_p.clone()
+                    else:
+                        buf = param_state['momentum_buffer']
+                        buf.mul_(momentum).add_(1 - dampening, d_p)
+                    if nesterov:
+                        d_p = d_p.add(momentum, buf)
+                    else:
+                        d_p = buf
+
+                p.data.add_(-group['lr'], d_p)
+
+        return loss
+
+    def step1(self, closure=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+        v=[]
+        for group in self.param_groups:
+            weight_decay = group['weight_decay']
+            momentum = group['momentum']
+            dampening = group['dampening']
+            nesterov = group['nesterov']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                d_p = p.grad.data
+                if weight_decay != 0:
+                    d_p.add_(weight_decay, p.data)
+                if momentum != 0:
+                    param_state = self.state[p]
+                    if 'momentum_buffer' not in param_state:
+                        buf = param_state['momentum_buffer'] = d_p.clone()
+                    else:
+                        buf = param_state['momentum_buffer']
+                        buf.mul_(momentum).add_(1 - dampening, d_p)
+                    if nesterov:
+                        d_p = d_p.add(momentum, buf)
+                    else:
+                        d_p = buf
+                v.append(d_p.cpu().numpy())
+
+                # p.data.add_(-group['lr'], d_p)
+
+        return v
+
+    def step2(self, v, closure=None):
+        """Performs a single optimization step.
+
+        Arguments:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        idx = 0
+        for group in self.param_groups:
+            weight_decay = group['weight_decay']
+            momentum = group['momentum']
+            dampening = group['dampening']
+            nesterov = group['nesterov']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                d_p = p.grad.data
+                # if weight_decay != 0:
+                #     d_p.add_(weight_decay, p.data)
+                # if momentum != 0:
+                #     param_state = self.state[p]
+                #     if 'momentum_buffer' not in param_state:
+                #         buf = param_state['momentum_buffer'] = d_p.clone()
+                #     else:
+                #         buf = param_state['momentum_buffer']
+                #         buf.mul_(momentum).add_(1 - dampening, d_p)
+                #     if nesterov:
+                #         d_p = d_p.add(momentum, buf)
+                #     else:
+                #         d_p = buf
+
+                p.data.add_(-group['lr'], torch.from_numpy(v[idx]).cuda(comm_rank))
+                idx = idx+1
+
+        return loss
+    
 
 
 class Net(nn.Module):
@@ -100,7 +254,8 @@ if comm_size > 1:
 if args.cuda:
     model.cuda(comm_rank)
 
-optimizer = optim.SGD(model.parameters(), lr=args.lr * comm_size if args.optim == 'ma' else args.lr, momentum=args.momentum)
+optimizer = mockSGD(model.parameters(), lr=args.lr * comm_size if args.optim == 'ma' else args.lr, momentum=args.momentum)
+# optimizer = optim.SGD(model.parameters(), lr=args.lr * comm_size if args.optim == 'ma' else args.lr, momentum=args.momentum)
 
 if args.optim == 'eds':
     psis_pre = [param.data.cpu().numpy() for param in model.parameters()]
@@ -113,7 +268,8 @@ if args.optim == 'try':
     moms_left = [np.zeros_like(param.data.cpu().numpy()) for param in model.parameters()]
     moms_right = [np.zeros_like(param.data.cpu().numpy()) for param in model.parameters()]
     traincnt = 0
-    
+
+
 
 
 def train(epoch):
@@ -216,36 +372,56 @@ def train(epoch):
                     param.data = torch.from_numpy(avg_param).cuda(comm_rank)
 
             elif args.optim == 'try':
-
-                global paramsleft_pre, paramsright_pre, traincnt, moms_left, moms_right
-                optimizer.step()
-                params = [param.data.cpu().numpy() for param in model.parameters()]
-
-                req_sendleft = comm.isend(params, dest = (comm_rank - 1) % comm_size, tag = batch_idx)
-                req_sendright = comm.isend(params, dest = (comm_rank + 1) % comm_size, tag = batch_idx)
-                params_left = comm.recv(source = (comm_rank - 1) % comm_size, tag = batch_idx)
-                params_right = comm.recv(source = (comm_rank + 1) % comm_size, tag = batch_idx)
+                #--------------------------------momentum term decentralized average together-----------------------------------------------
+                vs=optimizer.step1()
+                # params = [param.data.cpu().numpy() for param in model.parameters()]
+                req_sendleft = comm.isend(vs, dest = (comm_rank - 1) % comm_size, tag = batch_idx)
+                req_sendright = comm.isend(vs, dest = (comm_rank + 1) % comm_size, tag = batch_idx)
+                vs_left = comm.recv(source = (comm_rank - 1) % comm_size, tag = batch_idx)
+                vs_right = comm.recv(source = (comm_rank + 1) % comm_size, tag = batch_idx)
 
                 req_sendleft.wait()
                 req_sendright.wait()
 
-                if traincnt == 0:
-                    traincnt = traincnt + 1
-                    avg_params = [(param + param_left + param_right)/3 for param, param_left, param_right in zip(params, params_left, params_right)]
-                else:
-                    avg_params = [(param + param_left + param_right)/3 for param, param_left, param_right in zip(params, params_left, params_right)]
-                    # moms_left = [0.9 * mom_left + 0.1 * (param_left - paramleft_pre) for mom_left, param_left, paramleft_pre in zip(moms_left, params_left, paramsleft_pre)]
-                    # moms_right = [0.9 * mom_right + 0.1 * (param_right - paramright_pre) for mom_right, param_right, paramright_pre in zip(moms_right, params_right, paramsright_pre)]
-                    moms_left = [(param_left - paramleft_pre) for param_left, paramleft_pre in zip(params_left, paramsleft_pre)]
-                    moms_right = [(param_right - paramright_pre) for param_right, paramright_pre in zip(params_right, paramsright_pre)]
-                    avg_params = avg_params + moms_left + moms_right
-                    paramsleft_pre = params_left
-                    paramsright_pre = params_right
+                avg_v = [(v + v_left + v_right)/3 for v, v_left, v_right in zip(vs, vs_left, vs_right)]
+
+                # for param, avg_param in zip(model.parameters(), avg_params):
+                    # param.data = torch.from_numpy(avg_param).cuda(comm_rank)
+                optimizer.step2(avg_v)
 
 
-                for param, avg_param in zip(model.parameters(), avg_params):
-                    param.data = torch.from_numpy(avg_param).cuda(comm_rank)
 
+
+                #--------------------------------model average, and add a now-previous model's vector.-----------------------------------------------
+                # global paramsleft_pre, paramsright_pre, traincnt, moms_left, moms_right
+                # optimizer.step()
+                # params = [param.data.cpu().numpy() for param in model.parameters()]
+
+                # req_sendleft = comm.isend(params, dest = (comm_rank - 1) % comm_size, tag = batch_idx)
+                # req_sendright = comm.isend(params, dest = (comm_rank + 1) % comm_size, tag = batch_idx)
+                # params_left = comm.recv(source = (comm_rank - 1) % comm_size, tag = batch_idx)
+                # params_right = comm.recv(source = (comm_rank + 1) % comm_size, tag = batch_idx)
+
+                # req_sendleft.wait()
+                # req_sendright.wait()
+
+                # if traincnt == 0:
+                #     traincnt = traincnt + 1
+                #     avg_params = [(param + param_left + param_right)/3 for param, param_left, param_right in zip(params, params_left, params_right)]
+                # else:
+                #     avg_params = [(param + param_left + param_right)/3 for param, param_left, param_right in zip(params, params_left, params_right)]
+                #     moms_left = [0.9 * mom_left + 0.1 * (param_left - paramleft_pre) for mom_left, param_left, paramleft_pre in zip(moms_left, params_left, paramsleft_pre)]
+                #     moms_right = [0.9 * mom_right + 0.1 * (param_right - paramright_pre) for mom_right, param_right, paramright_pre in zip(moms_right, params_right, paramsright_pre)]
+                #     # moms_left = [(param_left - paramleft_pre) for param_left, paramleft_pre in zip(params_left, paramsleft_pre)]
+                #     # moms_right = [(param_right - paramright_pre) for param_right, paramright_pre in zip(params_right, paramsright_pre)]
+                #     avg_params = [avg_param + args.rho * mom_left + args.rho * mom_right for avg_param, mom_left, mom_right in zip(avg_params, moms_left, moms_right)]
+                #     paramsleft_pre = params_left
+                #     paramsright_pre = params_right
+
+                # for param, avg_param in zip(model.parameters(), avg_params):
+                #     param.data = torch.from_numpy(avg_param).cuda(comm_rank)
+
+                #--------------------------------send and add previous gradient-----------------------------------------------
                 # global gradleft_pre, gradright_pre
                 # grads = [param.grad.data.cpu().numpy() for param in model.parameters()]
                 # req_sendleft = comm.isend(grads + gradright_pre, dest = (comm_rank - 1) % comm_size, tag = batch_idx)
@@ -264,6 +440,7 @@ def train(epoch):
                 #     param.grad.data = torch.from_numpy(avg_grad).cuda(comm_rank)
                 # optimizer.step()
 
+                #--------------------------------model geometry average-----------------------------------------------
                 # optimizer.step()
                 # params = [param.data.cpu().numpy() for param in model.parameters()]
                 # req_sendleft = comm.isend(params, dest = (comm_rank - 1) % comm_size, tag = batch_idx)
@@ -281,7 +458,7 @@ def train(epoch):
 
 
 
-                ##dcasgd
+                #--------------------------------dcasgd-----------------------------------------------
                 # grads = [param.grad.data.cpu().numpy() for param in model.parameters()]
                 # req_sendleft = comm.isend(grads, dest = (comm_rank - 1) % comm_size, tag = batch_idx)
                 # req_sendright = comm.isend(grads, dest = (comm_rank + 1) % comm_size, tag = batch_idx)
@@ -316,6 +493,13 @@ def train(epoch):
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
                 epoch, batch_idx * len(data), len(train_loader.dataset),
                 100. * batch_idx / len(train_loader), loss.data[0]))
+
+    # -------------------additional model average ----------------------------
+    # params = [param.data.cpu().numpy() for param in model.parameters()]
+    # avg_params = [sum_param / comm_size for sum_param in comm.allreduce(params, op=mpi_list_sum)]
+    # for param, avg_param in zip(model.parameters(), avg_params):
+    #     param.data = torch.from_numpy(avg_param).cuda(comm_rank)
+    
 
 def test(epoch):
     model.eval()

@@ -1,5 +1,7 @@
 # from __future__ import print_function
 
+import torch
+
 from mpi4py import MPI
 
 comm = MPI.COMM_WORLD
@@ -10,7 +12,7 @@ def mpi_list_sum(x,y):
     return [a+b for a,b in zip(x,y)]
 
 import argparse
-import torch
+# import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -51,14 +53,14 @@ if args.batch_size % comm_size != 0:
 
 kwargs = {'num_workers': 0, 'pin_memory': False} if args.cuda else {}
 train_loader = torch.utils.data.DataLoader(
-    datasets.MNIST('../data', train=True, download=True,
+    datasets.MNIST('../data/mnist', train=True, download=True,
                    transform=transforms.Compose([
                        transforms.ToTensor(),
                        transforms.Normalize((0.1307,), (0.3081,))
                    ])),
     batch_size=args.batch_size, shuffle=True, **kwargs)
 test_loader = torch.utils.data.DataLoader(
-    datasets.MNIST('../data', train=False, transform=transforms.Compose([
+    datasets.MNIST('../data/mnist', train=False, transform=transforms.Compose([
                        transforms.ToTensor(),
                        transforms.Normalize((0.1307,), (0.3081,))
                    ])),
